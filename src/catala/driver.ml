@@ -23,6 +23,133 @@ let languages = [ ("en", Cli.En); ("fr", Cli.Fr); ("pl", Cli.Pl) ]
     representation. *)
 let extensions = [ (".catala_fr", "fr"); (".catala_en", "en"); (".catala_pl", "pl") ]
 
+let name_resolution ex_scope backend prgm =
+  Cli.debug_print "Name resolution...";
+  let ctxt = Surface.Name_resolution.form_context prgm in
+  let scope_uid =
+    match (ex_scope, backend) with
+    | None, Cli.Run -> Errors.raise_error "No scope was provided for execution."
+    | None, _ ->
+        snd
+          (try Desugared.Ast.IdentMap.choose ctxt.scope_idmap
+           with Not_found ->
+             Errors.raise_error (Printf.sprintf "There isn't any scope inside the program."))
+    | Some name, _ -> (
+        match Desugared.Ast.IdentMap.find_opt name ctxt.scope_idmap with
+        | None ->
+            Errors.raise_error (Printf.sprintf "There is no scope \"%s\" inside the program." name)
+        | Some uid -> uid)
+  in
+  (ctxt, prgm, scope_uid)
+
+let desugar_program (ctxt, prgm, scope_uid) =
+  Cli.debug_print "Desugaring...";
+  (Surface.Desugaring.desugar_program ctxt prgm, scope_uid)
+
+let desugared_to_scope backend output_file ex_scope (prgm, scope_uid) =
+  Cli.debug_print "Collecting rules...";
+  let prgm = Desugared.Desugared_to_scope.translate_program prgm in
+  if backend = Cli.Scopelang then begin
+    let fmt, at_end =
+      match output_file with
+      | Some f ->
+          let oc = open_out f in
+          (Format.formatter_of_out_channel oc, fun _ -> close_out oc)
+      | None -> (Format.std_formatter, fun _ -> ())
+    in
+    if Option.is_some ex_scope then
+      Format.fprintf fmt "%a\n" Scopelang.Print.format_scope
+        (scope_uid, Scopelang.Ast.ScopeMap.find scope_uid prgm.program_scopes)
+    else Format.fprintf fmt "%a\n" Scopelang.Print.format_program prgm;
+    at_end ();
+    exit 0
+  end;
+  (prgm, scope_uid)
+
+let scope_to_dcalc backend output_file ex_scope optimize (prgm, scope_uid) =
+  Cli.debug_print "Translating to default calculus...";
+  let prgm, prgm_expr, type_ordering = Scopelang.Scope_to_dcalc.translate_program prgm scope_uid in
+  let prgm =
+    if optimize then begin
+      Cli.debug_print "Optimizing default calculus...";
+      Dcalc.Optimizations.optimize_program prgm
+    end
+    else prgm
+  in
+  if backend = Cli.Dcalc then begin
+    let fmt, at_end =
+      match output_file with
+      | Some f ->
+          let oc = open_out f in
+          (Format.formatter_of_out_channel oc, fun _ -> close_out oc)
+      | None -> (Format.std_formatter, fun _ -> ())
+    in
+    if Option.is_some ex_scope then
+      Format.fprintf fmt "%a\n"
+        (Dcalc.Print.format_expr prgm.decl_ctx)
+        (let _, _, e = List.find (fun (name, _, _) -> name = scope_uid) prgm.scopes in
+         e)
+    else Format.fprintf fmt "%a\n" (Dcalc.Print.format_expr prgm.decl_ctx) prgm_expr;
+    at_end ();
+    exit 0
+  end;
+  (prgm, prgm_expr, type_ordering)
+
+let type_checking (prgm, prgm_expr, type_ordering) =
+  Cli.debug_print "Typechecking...";
+  let typ = Dcalc.Typing.infer_type prgm.Dcalc.Ast.decl_ctx prgm_expr in
+  (* Cli.debug_print (Format.asprintf "Typechecking results :@\n%a" Dcalc.Print.format_typ typ); *)
+  (prgm, prgm_expr, typ, type_ordering)
+
+let interpret (prgm, prgm_expr, _, _) =
+  Cli.debug_print "Starting interpretation...";
+  let results = Dcalc.Interpreter.interpret_program prgm.Dcalc.Ast.decl_ctx prgm_expr in
+  let out_regex = Re.Pcre.regexp "\\_out$" in
+  let results =
+    List.map
+      (fun ((v1, v1_pos), e1) ->
+        let v1 = Re.Pcre.substitute ~rex:out_regex ~subst:(fun _ -> "") v1 in
+        ((v1, v1_pos), e1))
+      results
+  in
+  let results = List.sort (fun ((v1, _), _) ((v2, _), _) -> String.compare v1 v2) results in
+  Cli.debug_print "End of interpretation";
+  Cli.result_print
+    (Format.asprintf "Computation successful!%s"
+       (if List.length results > 0 then " Results:" else ""));
+  List.iter
+    (fun ((var, _), result) ->
+      Cli.result_print
+        (Format.asprintf "@[<hov 2>%s@ =@ %a@]" var (Dcalc.Print.format_expr prgm.decl_ctx) result))
+    results;
+  0
+
+let compile_to_ocaml optimize source_file output_file (prgm, _, _, type_ordering) =
+  Cli.debug_print "Compiling program into lambda calculus...";
+  let prgm = Lcalc.Compile_with_exceptions.translate_program prgm in
+  let prgm =
+    if optimize then begin
+      Cli.debug_print "Optimizing lambda calculus...";
+      Lcalc.Optimizations.optimize_program prgm
+    end
+    else prgm
+  in
+  let source_file =
+    match source_file with
+    | Pos.FileName f -> f
+    | Contents _ -> Errors.raise_error "The OCaml backend does not work if the input is not a file"
+  in
+  let output_file =
+    match output_file with Some f -> f | None -> Filename.remove_extension source_file ^ ".ml"
+  in
+  Cli.debug_print (Printf.sprintf "Writing to %s..." output_file);
+  let oc = open_out output_file in
+  let fmt = Format.formatter_of_out_channel oc in
+  Cli.debug_print "Compiling program into OCaml...";
+  Lcalc.To_ocaml.format_program fmt prgm type_ordering;
+  close_out oc;
+  0
+
 (** Entry function for the executable. Returns a negative number in case of error. Usage:
     [driver source_file debug dcalc unstyled wrap_weaved_output backend language max_prec_digits trace optimize scope_to_execute output_file]*)
 let driver (source_file : Pos.input_file) (debug : bool) (unstyled : bool)
@@ -145,131 +272,18 @@ let driver (source_file : Pos.input_file) (debug : bool) (unstyled : bool)
         close_out oc;
         0
     | _ -> (
-        Cli.debug_print "Name resolution...";
-        let ctxt = Surface.Name_resolution.form_context prgm in
-        let scope_uid =
-          match (ex_scope, backend) with
-          | None, Cli.Run -> Errors.raise_error "No scope was provided for execution."
-          | None, _ ->
-              snd
-                (try Desugared.Ast.IdentMap.choose ctxt.scope_idmap
-                 with Not_found ->
-                   Errors.raise_error (Printf.sprintf "There isn't any scope inside the program."))
-          | Some name, _ -> (
-              match Desugared.Ast.IdentMap.find_opt name ctxt.scope_idmap with
-              | None ->
-                  Errors.raise_error
-                    (Printf.sprintf "There is no scope \"%s\" inside the program." name)
-              | Some uid -> uid)
-        in
-        Cli.debug_print "Desugaring...";
-        let prgm = Surface.Desugaring.desugar_program ctxt prgm in
-        Cli.debug_print "Collecting rules...";
-        let prgm = Desugared.Desugared_to_scope.translate_program prgm in
-        if backend = Cli.Scopelang then begin
-          let fmt, at_end =
-            match output_file with
-            | Some f ->
-                let oc = open_out f in
-                (Format.formatter_of_out_channel oc, fun _ -> close_out oc)
-            | None -> (Format.std_formatter, fun _ -> ())
-          in
-          if Option.is_some ex_scope then
-            Format.fprintf fmt "%a\n" Scopelang.Print.format_scope
-              (scope_uid, Scopelang.Ast.ScopeMap.find scope_uid prgm.program_scopes)
-          else Format.fprintf fmt "%a\n" Scopelang.Print.format_program prgm;
-          at_end ();
-          exit 0
-        end;
-        Cli.debug_print "Translating to default calculus...";
-        let prgm, prgm_expr, type_ordering =
-          Scopelang.Scope_to_dcalc.translate_program prgm scope_uid
-        in
-        let prgm =
-          if optimize then begin
-            Cli.debug_print "Optimizing default calculus...";
-            Dcalc.Optimizations.optimize_program prgm
-          end
-          else prgm
-        in
-        if backend = Cli.Dcalc then begin
-          let fmt, at_end =
-            match output_file with
-            | Some f ->
-                let oc = open_out f in
-                (Format.formatter_of_out_channel oc, fun _ -> close_out oc)
-            | None -> (Format.std_formatter, fun _ -> ())
-          in
-          if Option.is_some ex_scope then
-            Format.fprintf fmt "%a\n"
-              (Dcalc.Print.format_expr prgm.decl_ctx)
-              (let _, _, e = List.find (fun (name, _, _) -> name = scope_uid) prgm.scopes in
-               e)
-          else Format.fprintf fmt "%a\n" (Dcalc.Print.format_expr prgm.decl_ctx) prgm_expr;
-          at_end ();
-          exit 0
-        end;
-        Cli.debug_print "Typechecking...";
-        let _typ = Dcalc.Typing.infer_type prgm.decl_ctx prgm_expr in
-        (* Cli.debug_print (Format.asprintf "Typechecking results :@\n%a" Dcalc.Print.format_typ
-           typ); *)
-        match backend with
-        | Cli.Run ->
-            Cli.debug_print "Starting interpretation...";
-            let results = Dcalc.Interpreter.interpret_program prgm.decl_ctx prgm_expr in
-            let out_regex = Re.Pcre.regexp "\\_out$" in
-            let results =
-              List.map
-                (fun ((v1, v1_pos), e1) ->
-                  let v1 = Re.Pcre.substitute ~rex:out_regex ~subst:(fun _ -> "") v1 in
-                  ((v1, v1_pos), e1))
-                results
-            in
-            let results =
-              List.sort (fun ((v1, _), _) ((v2, _), _) -> String.compare v1 v2) results
-            in
-            Cli.debug_print "End of interpretation";
-            Cli.result_print
-              (Format.asprintf "Computation successful!%s"
-                 (if List.length results > 0 then " Results:" else ""));
-            List.iter
-              (fun ((var, _), result) ->
-                Cli.result_print
-                  (Format.asprintf "@[<hov 2>%s@ =@ %a@]" var
-                     (Dcalc.Print.format_expr prgm.decl_ctx)
-                     result))
-              results;
-            0
-        | Cli.OCaml ->
-            Cli.debug_print "Compiling program into lambda calculus...";
-            let prgm = Lcalc.Compile_with_exceptions.translate_program prgm in
-            let prgm =
-              if optimize then begin
-                Cli.debug_print "Optimizing lambda calculus...";
-                Lcalc.Optimizations.optimize_program prgm
-              end
-              else prgm
-            in
-            let source_file =
-              match source_file with
-              | FileName f -> f
-              | Contents _ ->
-                  Errors.raise_error "The OCaml backend does not work if the input is not a file"
-            in
-            let output_file =
-              match output_file with
-              | Some f -> f
-              | None -> Filename.remove_extension source_file ^ ".ml"
-            in
-            Cli.debug_print (Printf.sprintf "Writing to %s..." output_file);
-            let oc = open_out output_file in
-            let fmt = Format.formatter_of_out_channel oc in
-            Cli.debug_print "Compiling program into OCaml...";
-            Lcalc.To_ocaml.format_program fmt prgm type_ordering;
-            close_out oc;
-            0
-        | _ -> assert false
-        (* should not happen *))
+        prgm
+        |> name_resolution ex_scope backend
+        |> desugar_program
+        |> desugared_to_scope backend output_file ex_scope
+        |> scope_to_dcalc backend output_file ex_scope optimize
+        |> type_checking
+        |> (match backend with
+            | Cli.Run -> interpret
+            | Cli.OCaml -> compile_to_ocaml optimize source_file output_file
+            | _ -> assert false
+            (* should not happen *)))[@ocamlformat "disable"]
+
   with Errors.StructuredError (msg, pos) ->
     Cli.error_print (Errors.print_structured_error msg pos);
     -1
